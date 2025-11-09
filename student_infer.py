@@ -1,96 +1,58 @@
-# student_infer.py - Ensemble de modèles
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+
 def build_model(torch, nn, models, classes):
-    """
-    Charge DEUX modèles : EfficientNet-B3 et ResNet-50.
-    Retourne un tuple (models_list, classes, torch_ref)
-    """
-    # Charger EfficientNet-B3
-    try:
-        ckpt_eff = torch.load("efficientnet_b3_best.pt", map_location="cpu")
-        classes = [str(c) for c in ckpt_eff["classes"]]
-        
-        model_eff = models.efficientnet_b3(weights=None)
-        num_ftrs = model_eff.classifier[1].in_features
-        model_eff.classifier[1] = nn.Linear(num_ftrs, len(classes))
-        model_eff.load_state_dict(ckpt_eff["model"], strict=True)
-        model_eff.eval()
-        print("✅ EfficientNet-B3 chargé")
-    except Exception as e:
-        print(f"⚠️  EfficientNet-B3 non trouvé: {e}")
-        model_eff = None
+    # Assure-toi que c'est bien le bon fichier V3
+    ckpt = torch.load("resnet101_best_v3.pt", map_location="cpu")
+    classes = [str(c) for c in ckpt["classes"]]
     
-    # Charger ResNet-50
-    model_resnet = None
-    try:
-        ckpt_resnet = torch.load("resnet50_best.pt", map_location="cpu")
-        model_resnet = models.resnet50(weights=None)
-        num_ftrs = model_resnet.fc.in_features
-        model_resnet.fc = nn.Linear(num_ftrs, len(classes))
-        model_resnet.load_state_dict(ckpt_resnet["model"], strict=True)
-        model_resnet.eval()
-        print("✅ ResNet-50 chargé")
-    except Exception as e:
-        print(f"⚠️  ResNet-50 non trouvé (optionnel): {e}")
+    model = models.resnet101(weights=None)
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, len(classes))
     
-    # Retourner les modèles en tuple
-    models_list = [m for m in [model_eff, model_resnet] if m is not None]
+    model.load_state_dict(ckpt["model"], strict=True)
+    model.eval()
     
-    # Créer un objet "wrapper" qui a une méthode .eval()
-    class EnsembleWrapper:
-        def __init__(self, models_list, classes, torch_ref):
-            self.models_list = models_list
-            self.classes = classes
-            self.torch_ref = torch_ref
-        
-        def eval(self):
-            for m in self.models_list:
-                m.eval()
-            return self
-    
-    wrapper = EnsembleWrapper(models_list, classes, torch)
-    return wrapper, classes
+    return model, classes
 
-
-def predict(model_wrapper, image, preprocess, torch):
+def predict(model, image, preprocess, torch):
     """
-    Prédit en utilisant l'ENSEMBLE de modèles.
-    Combine les probabilités et retourne la classe avec la plus haute prob moyenne.
-    
-    Args:
-        model_wrapper: EnsembleWrapper contenant les modèles
-        image: Image PIL
-        preprocess: Transformations
-        torch: Module torch
-    
-    Returns:
-        int: Index de la classe prédite
+    Inférence avec TTA simple (Moyenne de l'image originale et retournée).
     """
-    models_list = model_wrapper.models_list
-    
-    # S'assurer que l'image est en RGB
     if image.mode != "RGB":
         image = image.convert("RGB")
+
+    device = next(model.parameters()).device
     
-    # Prétraiter l'image
-    x = preprocess(image).unsqueeze(0)
+    # Définition manuelle des transforms pour être sûr de ce qu'on fait
+    norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     
-    # Accumuler les probabilités de tous les modèles
-    ensemble_probs = None
+    # 1. Vue normale
+    t1 = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        norm
+    ])
     
+    # 2. Vue miroir (flip horizontal forcé)
+    t2 = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.RandomHorizontalFlip(p=1.0),
+        transforms.ToTensor(),
+        norm
+    ])
+
+    # Création du batch de 2 images [Originale, Miroir]
+    batch = torch.stack([t1(image), t2(image)]).to(device)
+
     with torch.inference_mode():
-        for i, model in enumerate(models_list):
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1)  # Probabilités [0, 1]
-            
-            if ensemble_probs is None:
-                ensemble_probs = probs.clone()
-            else:
-                ensemble_probs += probs
-    
-    # Moyenne des probabilités
-    ensemble_probs = ensemble_probs / len(models_list)
-    
-    # Prendre la classe avec la plus haute probabilité moyenne
-    pred_idx = int(ensemble_probs.argmax(1).item())
-    
+        logits = model(batch)
+        probs = torch.nn.functional.softmax(logits, dim=1)
+        # Moyenne des probabilités des 2 vues
+        avg_probs = probs.mean(dim=0)
+        pred_idx = int(avg_probs.argmax().item())
+
     return pred_idx
